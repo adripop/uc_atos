@@ -1,0 +1,19 @@
+
+UBERCART ATOS/SIPS CREDIT CARD PAYMENT
+
+INSTALLATION
+Installez et configurez sur votre serveur le kit ATOS/SIPS fourni par votre banque en suivant les explications fournies par la documentation.
+Copiez le dossier uc_atos du module dans votre dossier sites/all/modules.
+Allez à admin/build/modules et activez le module.
+Allez à admin/store/settings/payment/edit/methods et configurez le moyen de paiement ATOS/SIPS.
+
+MISE A JOUR
+Remplacer l'ancien dossier uc_atos par le nouveau.
+Visitez update.php.
+Visitez admin/build/modules/list pour reconstruire le cache du menu.
+Allez à admin/build/translate/import et importez le fichier de langues translations/fr.po présent dans le dossier du module.
+Si vous utilisez un serveur Windows, allez à admin/store/settings/payment/edit/methods et renseignez à nouveau les 3 chemins requis par l'API *sans doubler les backslashes* : ceci n'est plus nécessaire.
+
+CONTACT
+Ce module a été développé à l'origine par zmove.
+Réécrit ensuite par anrikun (Henri MEDOT <henri.medot[AT]absyx[DOT]fr> http://www.absyx.fr).

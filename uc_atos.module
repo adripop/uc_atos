@@ -1,0 +1,642 @@
+<?php
+
+/**
+ * @file
+ * Integrates the ATOS/SIPS payment service with Ubercart.
+ * First developped by zmove.
+ * Rewritten by anrikun (Henri MEDOT <henri.medot[AT]absyx[DOT]fr> http://www.absyx.fr).
+ * Update for Ubercart 3 by Adripop - adrien@avril.co - http://www.avril.co
+ */
+
+
+
+/*******************************************************************************
+ * Hook Functions (Drupal)
+ ******************************************************************************/
+
+/**
+ * Implementation of hook_menu().
+ */
+function uc_atos_menu() {
+  $items['cart/atos/autoresponse'] = array(
+    'title' => 'ATOS/SIPS autoresponse',
+    'page callback' => 'uc_atos_autoresponse',
+    'access callback' => 'uc_atos_autoresponse_access',
+    'type' => MENU_CALLBACK,
+  );
+  $items['cart/atos/complete'] = array(
+    'title' => 'ATOS/SIPS payment complete',
+    'page callback' => 'uc_atos_complete',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['cart/atos/cancel'] = array(
+    'title' => 'ATOS/SIPS payment cancelled',
+    'page callback' => 'uc_atos_cancel',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+// Make sure ATOS/SIPS always has access to send autoresponses.
+function uc_atos_autoresponse_access() {
+  return TRUE;
+}
+
+
+
+/**
+ * Implementation of hook_menu_alter().
+ */
+function uc_atos_menu_alter(&$items) {
+  $callback = $items['cart/checkout/complete']['page callback'];
+  if ($callback != 'uc_atos_checkout_complete') {
+    variable_set('uc_atos_checkout_complete_bak', $callback);
+    $items['cart/checkout/complete']['page callback'] = 'uc_atos_checkout_complete';
+  }
+}
+
+// Override uc_cart_checkout_complete() when payment method is atos.
+function uc_atos_checkout_complete() {
+  if (!$_SESSION['do_complete']
+   || !($order = uc_order_load(intval($_SESSION['cart_order'])))
+   || ($order->payment_method != 'atos')
+   || ($order->uid == 0)) {
+    return call_user_func(variable_get('uc_atos_checkout_complete_bak', 'uc_cart_checkout_complete'));
+  }
+
+  // Get checkout_complete output.
+  global $user;
+  if ($order->uid == $user->uid) {
+
+    // Build output for the already logged in user.
+    $messages['uc_msg_order_submit_format'] = variable_get('uc_msg_order_submit', uc_get_message('completion_message'));
+    $messages['uc_msg_order_logged_in_format'] = variable_get('uc_msg_order_logged_in', uc_get_message('completion_logged_in'));
+    $messages['uc_msg_continue_shopping_format'] = variable_get('uc_msg_continue_shopping', uc_get_message('continue_shopping'));
+
+    $output_message = '';
+    foreach ($messages as $format => $message) {
+      $message = token_replace($message, array('global' => NULL, 'order' => $order));
+      $message = check_markup($message, variable_get($format, filter_default_format()), FALSE);
+      $output_message .= $message;
+    }
+    $output = theme('uc_cart_complete_sale', array($output_message));
+  }
+  else {
+
+    // Use the output built during autoresponse.
+    $output = $order->data['atos']['complete_sale_output'];
+    unset($order->data['atos']['complete_sale_output']);
+    uc_atos_save_order_data($order);
+
+    // Login the user if specified.
+    if (($user->uid == 0) && variable_get('uc_new_customer_login', FALSE)) {
+      user_external_login(user_load($order->uid));
+    }
+  }
+
+  // Clear cart data.
+  uc_cart_empty(uc_cart_get_id());
+  unset($_SESSION['cart_order'], $_SESSION['do_complete']);
+
+  // Redirect to a custom page if defined.
+  $page = variable_get('uc_cart_checkout_complete_page', '');
+  if (!empty($page)) {
+    drupal_goto($page);
+  }
+
+  return $output;
+}
+
+
+
+/**
+ * Implementation of hook_form_alter().
+ */
+function uc_atos_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'uc_cart_checkout_review_form' && ($order_id = intval($_SESSION['cart_order'])) > 0) {
+    $order = uc_order_load($order_id);
+
+    if ($order->payment_method == 'atos') {
+
+      unset($form['actions']);
+      //unset($form['back']);
+      //$form['#prefix'] = '<table style="display: inline; padding-top: 1em;"><tr><td>';
+      //$form['#suffix'] = '</td><td>'.uc_atos_get_form($order).'</td></tr></table>';
+	$form['#suffix'] = uc_atos_get_form($order);
+    }
+  }
+}
+
+
+
+/*******************************************************************************
+ * Hook Functions (Ubercart)
+ ******************************************************************************/
+
+/**
+ * Implementation of hook_payment_method().
+ */
+function uc_atos_uc_payment_method() {
+  $title = variable_get('uc_atos_method_title', t('Credit card'));
+
+  $methods[] = array(
+    'id' => 'atos',
+    'name' => t('ATOS/SIPS'),
+    'title' => $title,
+    'review' => t('Credit card'),
+    'desc' => t('Redirect users to submit payments through ATOS/SIPS.'),
+    'callback' => 'uc_payment_method_atos',
+    'weight' => 3,
+    'checkout' => TRUE,
+    'no_gateway' => TRUE,
+  );
+
+  return $methods;
+}
+
+/**
+ * Implementation of hook_store_status().
+ * Gives some info/warning about uc_atos configuration.
+ */
+function uc_atos_store_status() {
+  $statuses = array();
+
+  // Warning about demo mode.
+  if (variable_get('uc_atos_mid', '') == '') {
+    $statuses[] = array(
+      'status' => 'warning',
+      'title' => t('ATOS/SIPS Configuration'),
+      'desc' => t('No merchant ID defined. ATOS/SIPS is working in demo mode.'),
+    );
+  }
+
+  // Error about API pathfile not found.
+  $path = variable_get('uc_atos_api_pathfile', '');
+  if (empty($path) || !is_file($path)) {
+    $statuses[] = array(
+      'status' => 'error',
+      'title' => t('ATOS/SIPS Configuration'),
+      'desc' => t('The pathfile could not be found. Please ensure your settings are correct.'),
+    );
+  }
+
+  return $statuses;
+}
+
+
+
+/*******************************************************************************
+ * Callback Functions, Forms, and Tables
+ ******************************************************************************/
+
+/**
+ * Callback for atos payment method settings.
+ */
+function uc_payment_method_atos($op, &$arg1) {
+  switch ($op) {
+    case 'cart-details':
+      $details = variable_get('uc_atos_method_description', t('Credit card secure payment.'));
+      return $details;
+
+    case 'settings':
+      $form['uc_atos_bank'] = array(
+        '#type' => 'select',
+        '#title' => t('Bank'),
+        '#description' => t('Select your bank (ATOS/SIPS provider).'),
+        '#options' => array(
+          'etransaction' => t('Crédit Agricole (e-transactions)'),
+          'sogenactif' => t('Société Générale (Sogenactif)'),
+          'cyberplus' => t('Banque Populaire (Cyberplus)'),
+          'mercanet' => t('BNP Paribas (Mercanet)'),
+          'scellius' => t('La Poste (Scellius)'),
+          'sherlocks' => t('LCL (Sherlocks)'),
+          'webaffaires' => t('Crédit du Nord (Webaffaires)'),
+          'elysnet' => t('HSBC (Elys Net)'),
+          'citelis' => t('Crédit Mutuel de Bretagne (Citélis)'),
+          'sips' => t('Atos Worldline (Sips)'),
+        ),
+        '#default_value' => variable_get('uc_atos_bank', FALSE),
+      );
+      $form['uc_atos_mid'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Merchant ID'),
+        '#description' => t("Your merchant ID. If you do not fill this field, the demo mode ID will be used."),
+        '#default_value' => uc_atos_get_mid(),
+        '#size' => 20,
+        '#maxlength' => 15,
+      );
+      $form['uc_atos_language'] = array(
+        '#type' => 'select',
+        '#title' => t('Language'),
+        '#description' => t("Select the language used on payment pages. If you run a multilingual website, the user's language will override this setting."),
+        '#options' => uc_atos_get_languages(),
+        '#default_value' => variable_get('uc_atos_language', 'fr'),
+      );
+      $form['uc_atos_method_title'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Payment method title'),
+        '#description' => t('Title that appears on the payment method selection page.'),
+        '#default_value' => variable_get('uc_atos_method_title', t('Credit card')),
+      );
+      $form['uc_atos_method_description'] = array(
+        '#type' => 'textarea',
+        '#rows' => 4,
+        '#title' => t('Payment method description'),
+        '#description' => t('Description that appears under the title when selected.'),
+        '#default_value' => variable_get('uc_atos_method_description', t('Credit card secure payment.')),
+      );
+      $form['uc_atos_api_pathfile'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Path to <em>pathfile</em>'),
+        '#description' => t('Full server-side path to the <em>pathfile</em> configuration file.'),
+        '#default_value' => variable_get('uc_atos_api_pathfile', ''),
+        '#required' => TRUE,
+      );
+      $form['uc_atos_api_pathrequest'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Path to <em>request[.exe]</em>'),
+        '#description' => t('Full server-side path to the <em>request[.exe]</em> binary file.'),
+        '#default_value' => variable_get('uc_atos_api_pathrequest', ''),
+        '#required' => TRUE,
+      );
+      $form['uc_atos_api_pathresponse'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Path to <em>response[.exe]</em>'),
+        '#description' => t('Full server-side path to the <em>response[.exe]</em> binary file.'),
+        '#default_value' => variable_get('uc_atos_api_pathresponse', ''),
+        '#required' => TRUE,
+      );
+      return $form;
+  }
+}
+
+
+
+/**
+ * Builds the request form.
+ */
+function uc_atos_get_form($order) {
+  $path_bin = variable_get('uc_atos_api_pathrequest', '');
+  $params = _uc_atos_build_request($order);
+  $results = _uc_atos_exec($path_bin, $params);
+
+  $code = $results[1];
+  $error = $results[2];
+  $message = $results[3];
+
+  if (($code == '') && ($error == '')) {
+    drupal_set_message(t('Request call error: request executable file not found.'), 'error');
+  }
+  else if ($code != 0) {
+    drupal_set_message(t('Payment API call error: @error', array('@error' => $error)), 'error');
+  }
+  else {
+    // Add amount and transaction_id to the order's data array.
+    $order->data['atos']['amount'] = $params['amount'];
+    $order->data['atos']['transaction_id'] = $params['transaction_id'];
+
+    // Save the updated data array to the database.
+    uc_atos_save_order_data($order);
+  }
+
+  drupal_set_message($error); // debug mode only
+  return $message;
+}
+
+
+
+/**
+ * Save order's updated data array to the database.
+ */
+function uc_atos_save_order_data($order) {
+ db_query("UPDATE {uc_orders} SET data = :data WHERE order_id = :order", array('data' => serialize($order->data), 'order' => $order->order_id));
+}
+
+
+
+/**
+ * Handles autoresponse.
+ */
+function uc_atos_autoresponse() {
+  if (!isset($_POST['DATA'])) {
+    watchdog('uc_atos', 'Autoresponse attempted without any POST data.', array(), WATCHDOG_WARNING);
+    return;
+  }
+
+  $response = _uc_atos_parse_response($_POST['DATA']);
+  if (!isset($response['code']) || ($response['code'] != 0)) {
+    watchdog('uc_atos', 'Autoresponse error: @error', array('@error' => $response['error']), WATCHDOG_ERROR);
+    return;
+  }
+
+  $order_id = intval($response['order_id']);
+  $order = uc_order_load($order_id);
+
+  if (!$order) {
+    watchdog('uc_atos', 'Autoresponse attempted for non-existent order.', array(), WATCHDOG_ERROR);
+    return;
+  }
+
+  if (!isset($order->data['atos']['transaction_id'])) {
+    watchdog('uc_atos', 'Autoresponse attempted for an order not submitted yet.', array(), WATCHDOG_ERROR);
+    return;
+  }
+
+  $request = array_merge(_uc_atos_build_request($order), $order->data['atos']);
+  $response = _uc_atos_parse_response($_POST['DATA']);
+
+  $names = array(
+    'amount',
+    'transaction_id',
+    'customer_email',
+    'customer_id',
+    'currency_code',
+    'merchant_country',
+    'merchant_id',
+  );
+  $invalid = FALSE;
+  foreach ($names as $name) {
+    if ($request[$name] != $response[$name]) {
+      $invalid = TRUE;
+      break;
+    }
+  }
+  if ($invalid) {
+    $dump = print_r(array(
+      'request' => $request,
+      'response' => $response,
+    ), TRUE);
+    watchdog('uc_atos', 'Autoresponse and request do not match: <pre>@dump</pre>', array('@dump' => $dump), WATCHDOG_ERROR);
+    return;
+  }
+
+  if (!isset($response['response_code']) || ($response['response_code'] != '00') || empty($response['authorisation_id'])) {
+    uc_order_comment_save($order_id, 0, t("The customer's attempted payment from a bank account may have failed. Response code is @code.", array('@code' => $response['response_code'])), 'admin');
+    return;
+  }
+
+  if ($payments = uc_payment_load_payments($order_id)) {
+    foreach ($payments as $payment) {
+      if (($data = unserialize($payment->data)) && isset($data['authorisation_id']) && ($data['authorisation_id'] == $response['authorisation_id'])) {
+        watchdog('uc_atos', 'Authorisation ID @id has been processed before.', array('@id' => $response['authorisation_id']), WATCHDOG_NOTICE);
+        return;
+      }
+    }
+  }
+
+  $context = array(
+    'revision' => 'formatted-original',
+    'type' => 'amount',
+  );
+  $options = array(
+    'sign' => FALSE,
+  );
+  $amount = $response['amount'] / 100;
+  $currency = uc_atos_get_currency_code($response['currency_code'], TRUE);
+
+  $comment = t('ATOS/SIPS authorisation ID: @id', array('@id' => $response['authorisation_id']));
+  uc_payment_enter($order_id, 'atos', $amount, $order->uid, $response, $comment);
+  $order->data['atos']['complete_sale_output'] = uc_cart_complete_sale($order);
+  uc_atos_save_order_data($order);
+
+  uc_order_comment_save($order_id, 0, t('Payment of @amount @currency submitted through ATOS/SIPS.', array('@amount' => uc_price($amount, $context, $options), '@currency' => $currency)), 'order', 'payment_received');
+  uc_order_comment_save($order_id, 0, t('ATOS/SIPS autoresponse reported a payment of @amount @currency.', array('@amount' => uc_price($amount, $context, $options), '@currency' => $currency)));
+}
+
+
+
+/**
+ * Handles a complete payment.
+ */
+function uc_atos_complete() {
+  if (!isset($_POST['DATA'])) {
+    drupal_goto('cart');
+  }
+
+  $response = _uc_atos_parse_response($_POST['DATA']);
+  if (!isset($response['code']) || ($response['code'] != 0) || !isset($response['order_id'])) {
+    drupal_goto('cart');
+  }
+
+  // Leave an ambiguous message when posted order ID is different from the one in the user's session.
+  if ($response['order_id'] != intval($_SESSION['cart_order'])) {
+    drupal_set_message(t('Thank you for your order! We will be notified that we have received your payment.'));
+    drupal_goto('cart');
+  }
+
+  // This lets us know it's a legitimate access of the complete page.
+  $_SESSION['do_complete'] = TRUE;
+
+  drupal_goto('cart/checkout/complete');
+}
+
+
+
+/**
+ * Handles a cancelled payment.
+ */
+function uc_atos_cancel() {
+  unset($_SESSION['cart_order']);
+
+  drupal_set_message(t('Your payment was cancelled. Please feel free to continue shopping or contact us for assistance.'));
+
+  drupal_goto('cart');
+}
+
+
+
+/**
+ * Get an array of the languages supported by ATOS/SIPS.
+ */
+function uc_atos_get_languages() {
+  return array(
+    'fr' => t('French'),
+    'en' => t('English'),
+    'ge' => t('German'),
+    'sp' => t('Spanish'),
+    'it' => t('Italian'),
+  );
+}
+
+
+
+/**
+ * Get the merchant ID.
+ * If empty, return a demo ID.
+ */
+function uc_atos_get_mid() {
+  $demo_mids = array(
+    'etransaction' => '013044876511111',
+    'sogenactif'   => '014213245611111',
+    'cyberplus'    => '038862749811111',
+    'mercanet'     => '082584341411111',
+    'scellius'     => '014141675911111',
+    'sherlocks'    => '014295303911111',
+    'webaffaires'  => '014022286611111',
+    'elysnet'      => '014102450311111',
+    'citelis'      => '029800266211111',
+    'sips'         => '011223344551111',
+  );
+
+  $mid = variable_get('uc_atos_mid', '');
+  $bank = variable_get('uc_atos_bank', '');
+  if (empty($mid) && isset($demo_mids[$bank])) {
+    $mid = $demo_mids[$bank];
+  }
+
+  return $mid;
+}
+
+
+
+/**
+ * Get the currency code of the provided store currency.
+ * If $flip is TRUE, return the store currency of the provided currency code.
+ */
+function uc_atos_get_currency_code($store_currency, $flip = FALSE) {
+  $currencies = array(
+    'EUR' => '978',
+    'USD' => '840',
+    'CHF' => '756',
+    'GBP' => '826',
+    'CAD' => '124',
+    'JPY' => '392',
+    'MXP' => '484',
+    'TRL' => '792',
+    'AUD' => '036',
+    'NZD' => '554',
+    'NOK' => '578',
+    'BRC' => '986',
+    'ARP' => '032',
+    'KHR' => '116',
+    'TWD' => '901',
+    'SEK' => '752',
+    'DKK' => '208',
+    'KRW' => '410',
+    'SGD' => '702',
+  );
+  if ($flip) {
+    $currencies = array_flip($currencies);
+  }
+  return (isset($currencies[$store_currency])) ? $currencies[$store_currency] : '';
+}
+
+
+
+/**
+ * Build a request based on the provided order.
+ * Return an array containing request fields.
+ */
+function _uc_atos_build_request($order) {
+  $amount = round($order->order_total * 100, 0);
+  $currency_code = uc_atos_get_currency_code(variable_get('uc_currency_code', 'USD'));
+
+  global $language;
+  $languages = uc_atos_get_languages();
+  $request_language = isset($languages[$language->language]) ? $language->language : variable_get('uc_atos_language', 'fr');
+
+  $merchant_country = strtolower(db_query('SELECT country_iso_code_2 FROM {uc_countries} WHERE country_id = :country_id', array( 'country_id' => variable_get('uc_store_country', '250')))->fetchField());
+  $merchant_id = uc_atos_get_mid();
+  $pathfile = variable_get('uc_atos_api_pathfile', '');
+
+  $request = array(
+    'amount' => $amount,
+    'automatic_response_url' => url('cart/atos/autoresponse', array('absolute' => TRUE)),
+    'caddie' => uc_cart_get_id(),
+    'cancel_return_url' => url('cart/atos/cancel', array('absolute' => TRUE)),
+    //certificate_date,
+    'customer_email' => $order->primary_email,
+    'customer_id' => $order->uid,
+    'currency_code' => $currency_code,
+    'header_flag' => 'yes',
+    'language' => $request_language,
+    'merchant_country' => $merchant_country,
+    'merchant_id' => $merchant_id,
+    'normal_return_url' => url('cart/atos/complete', array('absolute' => TRUE)),
+    'order_id' => $order->order_id,
+    'transaction_id' => rand(0, 9).substr(time(), -5),
+    //transmission_date,
+    //version,
+    'pathfile' => $pathfile,
+  );
+
+  return $request;
+}
+
+
+
+/**
+ * Parse a response based on the provided POST data.
+ * Return an array containing the response fields.
+ */
+function _uc_atos_parse_response($message) {
+  $path_bin = variable_get('uc_atos_api_pathresponse', '');
+  $params = array(
+    'pathfile' => variable_get('uc_atos_api_pathfile', ''),
+    'message' => $message,
+  );
+  $results = _uc_atos_exec($path_bin, $params);
+
+  return array(
+    'code' => $results[1],
+    'error' => $results[2],
+    'merchant_id' => $results[3],
+    'merchant_country' => $results[4],
+    'amount' => $results[5],
+    'transaction_id' => $results[6],
+    'payment_means' => $results[7],
+    'transmission_date' => $results[8],
+    'payment_time' => $results[9],
+    'payment_date' => $results[10],
+    'response_code' => $results[11],
+    'payment_certificate' => $results[12],
+    'authorisation_id' => $results[13],
+    'currency_code' => $results[14],
+    'card_number' => $results[15],
+    'cvv_flag' => $results[16],
+    'cvv_response_code' => $results[17],
+    'bank_response_code' => $results[18],
+    'complementary_code' => $results[19],
+    'complementary_info' => $results[20],
+    'return_context' => $results[21],
+    'caddie' => $results[22],
+    'receipt_complement' => $results[23],
+    'merchant_language' => $results[24],
+    'language' => $results[25],
+    'customer_id' => $results[26],
+    'order_id' => $results[27],
+    'customer_email' => $results[28],
+    'customer_ip_address' => $results[29],
+    'capture_day' => $results[30],
+    'capture_mode' => $results[31],
+    'data' => $results[32],
+  );
+}
+
+
+
+/**
+ * Execute an ATOS/SIPS binary.
+ * Return an array of results.
+ */
+function _uc_atos_exec($path_bin, $params) {
+  $pairs = array();
+  foreach ($params as $key => $value) {
+    $pairs[] = escapeshellarg("$key=$value");
+  }
+
+  if (strstr($_SERVER['SERVER_SOFTWARE'], 'Win32') || strstr($_SERVER['SERVER_SOFTWARE'], 'IIS')) {
+    $command = '"'.escapeshellarg($path_bin).' '.implode(' ', $pairs).'"';
+  }
+  else {
+    $command = $path_bin.' '.implode(' ', $pairs);
+  }
+
+  $result = exec($command);
+  return explode('!', $result);
+}

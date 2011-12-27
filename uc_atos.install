@@ -1,0 +1,9 @@
+<?php
+
+/**
+ * hook_uninstall() - please refer to api.drupal.org
+ */
+function uc_actos_uninstall(){
+	db_query("DELETE FROM {variable} 
+				WHERE name LIKE 'uc_atos_%%'");
+}
